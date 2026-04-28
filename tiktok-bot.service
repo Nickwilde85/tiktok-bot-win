@@ -1,0 +1,14 @@
+[Unit]
+Description=TikTok Downloader Bot
+After=network.target
+
+[Service]
+Type=simple
+User=mika
+WorkingDirectory=/home/mika/tiktok-bot
+ExecStart=/home/mika/.pyenv/versions/3.11.9/bin/python /home/mika/tiktok-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

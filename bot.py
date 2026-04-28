@@ -22,6 +22,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set in .env file")
 
+HTTP_PROXY = os.getenv("HTTP_PROXY")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY")
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -41,6 +44,10 @@ def download_tiktok_video(url: str, output_path: str) -> str:
             'Referer': 'https://www.tiktok.com/',
         }
     }
+    
+    if HTTP_PROXY or HTTPS_PROXY:
+        proxy = HTTPS_PROXY or HTTP_PROXY
+        ydl_opts['proxy'] = proxy
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -115,25 +122,41 @@ async def extract_tiktok_photos(url: str) -> list:
     return image_urls[:10]  # Limit to 10 photos
 
 
-def download_tiktok_content(url: str, temp_dir: str) -> dict:
-    """Download TikTok content (video or photos) and return info."""
-    # Check if it's a photo post
-    if '/photo/' in url:
+def download_video_content(url: str, temp_dir: str) -> dict:
+    """Download video content from TikTok, YouTube, or Pinterest using yt-dlp."""
+    # Check if it's a TikTok photo post
+    if '/photo/' in url and 'tiktok.com' in url:
         # Return marker that this needs async photo extraction
         return {'type': 'photos_async', 'url': url}
     
-    # It's a video - download it with yt-dlp (no photo check needed here)
+    # It's a video - download it with yt-dlp
     output_path = os.path.join(temp_dir, "video.%(ext)s")
+    
+    # Determine platform for appropriate headers
+    if 'tiktok.com' in url:
+        referer = 'https://www.tiktok.com/'
+    elif 'youtube.com' in url or 'youtu.be' in url:
+        referer = 'https://www.youtube.com/'
+    elif 'pinterest.com' in url or 'pin.it' in url:
+        referer = 'https://www.pinterest.com/'
+    else:
+        referer = url
+    
     ydl_opts = {
-        'format': 'best',
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
+        'merge_output_format': 'mp4',
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://www.tiktok.com/',
+            'Referer': referer,
         }
     }
+    
+    if HTTP_PROXY or HTTPS_PROXY:
+        proxy = HTTPS_PROXY or HTTP_PROXY
+        ydl_opts['proxy'] = proxy
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -141,7 +164,7 @@ def download_tiktok_content(url: str, temp_dir: str) -> dict:
         return {
             'type': 'video',
             'path': video_path,
-            'title': info.get('title', 'TikTok Video'),
+            'title': info.get('title', 'Video'),
             'webpage_url': info.get('webpage_url', url)
         }
 
@@ -149,9 +172,12 @@ def download_tiktok_content(url: str, temp_dir: str) -> dict:
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Привет! Я бот для скачивания видео из TikTok.\n\n"
-        "📱 Просто отправь мне ссылку на TikTok видео или фото, и я скачаю его в максимальном качестве.\n\n"
-        "⚡️ Поддерживаются параллельные загрузки!"
+        "👋 Привет! Я бот для скачивания видео.\n\n"
+        "📱 Поддерживаемые платформы:\n"
+        "• TikTok (видео и фото)\n"
+        "• YouTube\n"
+        "• Pinterest\n\n"
+        "⚡️ Просто отправь мне ссылку, и я скачаю контент в максимальном качестве!"
     )
 
 
@@ -159,13 +185,13 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     await message.answer(
         "📋 <b>Как использовать:</b>\n"
-        "1. Отправь ссылку на TikTok видео или фото\n"
+        "1. Отправь ссылку на видео\n"
         "2. Дождись загрузки\n"
         "3. Получи контент в максимальном качестве!\n\n"
-        "🔗 <b>Поддерживаемые форматы ссылок:</b>\n"
-        "• https://vm.tiktok.com/xxxxx\n"
-        "• https://www.tiktok.com/@user/video/xxxxx\n"
-        "• https://www.tiktok.com/@user/photo/xxxxx",
+        "🔗 <b>Поддерживаемые платформы:</b>\n"
+        "• TikTok: vm.tiktok.com, tiktok.com/@user/video, tiktok.com/@user/photo\n"
+        "• YouTube: youtube.com/watch?v=, youtu.be/\n"
+        "• Pinterest: pinterest.com/pin/, pin.it/",
         parse_mode="HTML"
     )
 
@@ -176,7 +202,17 @@ async def process_download(message: Message, url: str):
     status_message = await message.answer("⏳ Скачиваю контент в максимальном качестве...")
     
     try:
-        # Normalize URL for yt-dlp (convert /photo/ to /video/)
+        # Clean URL - remove playlist parameters
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        query_params = parse_qs(parsed.query)
+        # Keep only 'v' parameter for YouTube, remove others like 'list'
+        if 'youtube.com' in url or 'youtu.be' in url:
+            if 'v' in query_params:
+                clean_query = f"v={query_params['v'][0]}"
+                url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{clean_query}"
+        
+        # Normalize URL for yt-dlp (convert /photo/ to /video/ for TikTok)
         url = normalize_tiktok_url(url)
         logger.info(f"Normalized URL: {url}")
         
@@ -186,7 +222,7 @@ async def process_download(message: Message, url: str):
         with tempfile.TemporaryDirectory() as temp_dir:
             loop = asyncio.get_event_loop()
             content = await loop.run_in_executor(
-                None, download_tiktok_content, url, temp_dir
+                None, download_video_content, url, temp_dir
             )
             
             video_file = FSInputFile(content['path'])
@@ -206,7 +242,7 @@ async def process_download(message: Message, url: str):
         )
 
 
-@dp.message(F.text.regexp(r'https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)/.+'))
+@dp.message(F.text.regexp(r'https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|youtube\.com|youtu\.be|pinterest\.com|pin\.it)/.+'))
 async def download_video(message: Message):
     url = message.text.strip()
     await process_download(message, url)
@@ -216,7 +252,7 @@ async def download_video(message: Message):
 async def unknown_message(message: Message):
     await message.answer(
         "🤔 Я не понимаю это сообщение.\n"
-        "Отправь мне ссылку на TikTok видео или используй /help"
+        "Отправь мне ссылку на видео (TikTok, YouTube, Pinterest) или используй /help"
     )
 
 
